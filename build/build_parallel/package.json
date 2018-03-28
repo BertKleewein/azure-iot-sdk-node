@@ -24,6 +24,8 @@
     "es6-promisify": "^5.0.0",
     "find-root": "^1.1.0",
     "jshint": "^2.9.5",
-    "npm-run-all": "^4.1.1"
+    "npm-run-all": "^4.1.1",
+    "resolve-path": "^1.4.0",
+    "yargs": "^10.1.1"
   }
 }

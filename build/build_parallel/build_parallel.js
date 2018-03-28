@@ -13,30 +13,39 @@ var EventEmitter = require('events');
 var config = require('./config.json');
 const debug = require('debug')('azure-iot-tools-build-parallel');
 
+var argv = require('yargs')
+  .usage('Usage: $0 [command] <set--just-print> <--directory dir>')
+  .command('setup', 'npm link, install, and build')
+  .command('teardown', 'npm unlink, etc')
+  .command('build', 'npm build')
+  .command('test', 'npm test')
+  .command('ci', 'npm run ci')
+  .option('just-print', { default: false })
+  .option('directory', { describe: 'optional directory to build'})
+  .demandCommand()
+  .help(false)
+  .version(false)
+  .wrap(null)
+  .argv;
+
+let taskName = argv._[0];
+let singleDirectoryToBuild = argv.directory && path.resolve(argv.directory);
+let justPrint = argv['just-print'];
+
+if (singleDirectoryToBuild) {
+  console.log('only building ' + singleDirectoryToBuild);
+}
+
 // See section titled "About MaxListenersExceededWarning" in https://github.com/mysticatea/npm-run-all/blob/HEAD/docs/node-api.md
 EventEmitter.defaultMaxListeners = 30;
-
-/**
- * Print usage information
- */
-var usage = function () {
-  console.log('usage: node ' + __filename + ' task');
-  console.log('where task is one of:');
-  for (var taskName in config.tasks) {
-    if (config.tasks.hasOwnProperty(taskName)) {
-      console.log("  " + taskName + " - " + config.tasks[taskName].description);
-    }
-  }
-};
 
 /**
  * Do miscellaneous work necessary to set up the running of this script.
  */
 var initializeEnvironment = promisify(function (callback) {
-  let taskName = (process.argv.length > 2 && process.argv[2]) || 'teardown';
   config.task = config.tasks[taskName];
   if (!config.task) {
-    usage();
+    console.log('unknown task');
     process.exit(1);
   }
   config.task.name = taskName;
@@ -81,6 +90,31 @@ var preprocessConfigFile = promisify(function (callback) {
     }
   }
 
+  // If we're only building a single directory, make sure it's in our list.
+  let singleProjectNameToBuild;
+  if (singleDirectoryToBuild) {
+    let alreadyExistsInList = false;
+    config.projects.forEach(function(project){
+      if (project.fullpath === singleDirectoryToBuild) {
+        alreadyExistsInList = true;
+        singleProjectNameToBuild = project.name;
+      }
+    });
+    if (!alreadyExistsInList) {
+      let project = [];
+      project.fullpath = singleDirectoryToBuild;
+      project.directory = path.relative(config.gitRoot, project.fullpath);
+      project.packageJson = require(path.join(project.fullpath, 'package.json'));
+      project.name = project.packageJson.name;
+      project.dependencies = [];
+      project.consumers = [];
+      project.runTask = true;
+      tempProjectObject[project.name] = project;
+      singleProjectNameToBuild = project.name;
+      config.projects.push(project);
+    }
+  }
+
   // In the second sweep. we build arrays of dependencies and consumers
   for (let i = 0; i < config.projects.length; i++) {
     let project = config.projects[i];
@@ -98,6 +132,37 @@ var preprocessConfigFile = promisify(function (callback) {
         }
       }
     });
+  }
+
+  // Finally, if we're only building a single directory, strip everything else out
+  if (singleDirectoryToBuild) {
+    // assume we're not going to build anything
+    config.projects.forEach(function(project){
+      project.buildMe = false;
+    });
+    // recursively mark all of our depenencies.
+    var recursivelyMarkDependencies = function(projectName) {
+      debug('mark ' + projectName + ' to build');
+      var project = tempProjectObject[projectName];
+      project.buildMe = true;
+      project.dependencies.forEach(function(dependency) {
+        if (!dependency.buildMe) {
+          debug(projectName + ' depends on ' + dependency.name);
+          recursivelyMarkDependencies(dependency.name);
+        }
+      });
+    };
+    recursivelyMarkDependencies(singleProjectNameToBuild);
+    // we're done with this object.  make sure nobody else uses it.
+    tempProjectObject = null;
+    // Make a new project list that only has the projects we want to build.
+    var newConfigProjects = [];
+    config.projects.forEach(function (project) {
+      if (project.buildMe) {
+        newConfigProjects.push(project);
+      }
+    });
+    config.projects = newConfigProjects;
   }
   callback();
 });
@@ -212,30 +277,36 @@ var makeTaskFunction = function (subtasks) {
   var subtaskname = '[' + subtasks.join(', ').replace(/^(.*), (.*)$/, '$1, & $2') + ']';
 
   var func = function (done) {
-    console.log();
-    console.log();
+    if (!justPrint) {
+      console.log();
+      console.log();
+    }
     console.log('running ' + subtaskname);
-    runAll(subtasks, options)
-      .then((results) => {
-        console.log();
-        console.log("done with " + subtaskname);
-        for (let i = 0; i < results.length; i++) {
-          console.log(results[i].name + ' : ' + (results[i].code === 0 ? 'succeeded' : 'failed'));
-        }
-        done();
-      })
-      .catch(err => {
-        console.log("failed " + subtaskname);
-        console.log(err.message);
-        for (let i = 0; i < err.results.length; i++) {
-          console.log(err.results[i].name + ' : ' + (err.results[i].code === 0 ? 'succeeded' : 'failed'));
-        }
-        if (config.task.continueOnError) {
+    if (justPrint) {
+      done();
+    } else {
+      runAll(subtasks, options)
+        .then((results) => {
+          console.log();
+          console.log("done with " + subtaskname);
+          for (let i = 0; i < results.length; i++) {
+            console.log(results[i].name + ' : ' + (results[i].code === 0 ? 'succeeded' : 'failed'));
+          }
           done();
-        } else {
-          done(new Error());
-        }
-      });
+        })
+        .catch(err => {
+          console.log("failed " + subtaskname);
+          console.log(err.message);
+          for (let i = 0; i < err.results.length; i++) {
+            console.log(err.results[i].name + ' : ' + (err.results[i].code === 0 ? 'succeeded' : 'failed'));
+          }
+          if (config.task.continueOnError) {
+            done();
+          } else {
+            done(new Error());
+          }
+        });
+    }
   };
 
   return func;
